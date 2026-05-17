@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+supabase
+google-genai
+livekit-agents>=1.5.0
+livekit-plugins-deepgram>=0.6.0
+livekit-plugins-cartesia>=0.1.0
+livekit-plugins-silero>=0.6.0
+pydantic
+pydantic-settings
+httpx
+python-multipart
+websockets
+aiohttp
