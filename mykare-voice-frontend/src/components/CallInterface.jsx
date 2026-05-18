@@ -2,18 +2,32 @@
  * CallInterface — center panel
  * Shows avatar, call status, and call controls.
  */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { api } from '../lib/api'
 
 export default function CallInterface({
   status,
   isMuted,
   agentSpeaking,
+  localVideoTrack,
   onConnect,
   onDisconnect,
   onToggleMute,
 }) {
   const [avatarUrl, setAvatarUrl] = useState(null)
+  const videoRef = useRef(null)
+
+  // Attach local video track
+  useEffect(() => {
+    if (localVideoTrack && videoRef.current) {
+      localVideoTrack.attach(videoRef.current)
+    }
+    return () => {
+      if (localVideoTrack && videoRef.current) {
+        localVideoTrack.detach(videoRef.current)
+      }
+    }
+  }, [localVideoTrack])
 
   // Try to load Tavus avatar on mount
   useEffect(() => {
@@ -49,7 +63,7 @@ export default function CallInterface({
         )}
       </div>
 
-      <div className="avatar-zone">
+      <div className="avatar-zone" style={{ position: 'relative' }}>
         {/* Avatar */}
         <div className={`avatar-frame ${agentSpeaking && isActive ? 'speaking' : ''}`}>
           {avatarUrl && isActive ? (
@@ -64,6 +78,30 @@ export default function CallInterface({
             </div>
           )}
         </div>
+
+        {/* User Local Video */}
+        {localVideoTrack && isActive && (
+          <div style={{
+            position: 'absolute',
+            bottom: '80px',
+            right: '20px',
+            width: '120px',
+            height: '160px',
+            borderRadius: '12px',
+            overflow: 'hidden',
+            border: '2px solid var(--border)',
+            background: '#000',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.5)'
+          }}>
+            <video 
+              ref={videoRef} 
+              autoPlay 
+              playsInline 
+              muted 
+              style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+            />
+          </div>
+        )}
 
         {/* Status text */}
         <div style={{ textAlign: 'center' }}>

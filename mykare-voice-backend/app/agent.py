@@ -8,20 +8,23 @@ Run with:
 import asyncio
 import json
 import logging
+import time
 import uuid
 from typing import Optional
 
 from google import genai
-from livekit import rtc
+from google.genai import types
 from livekit.agents import (
+    Agent,
+    AgentSession,
     AutoSubscribe,
+    DEFAULT_API_CONNECT_OPTIONS,
     JobContext,
+    NOT_GIVEN,
     WorkerOptions,
     cli,
     llm,
-    DEFAULT_API_CONNECT_OPTIONS,
 )
-from livekit.agents.voice import Agent as VoiceAssistant
 from livekit.plugins import cartesia, deepgram, silero
 
 from app.config import settings
@@ -38,162 +41,126 @@ from app.tools import (
 
 logger = logging.getLogger("mykare.agent")
 
-# Configure Gemini Client
-client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
+# ─── Event Emitter ─────────────────────────────────────────────────────────
 
-# ─── WebSocket Event Emitter ───────────────────────────────────────────────
-# We publish tool events to the LiveKit room's data channel so the
-# frontend receives them in real-time without a separate WebSocket.
-
-async def emit_tool_event(ctx: JobContext, event: dict):
-    """Publish a tool event to all participants in the room."""
+async def emit_event(ctx: JobContext, event: dict):
     try:
-        payload = json.dumps(event).encode()
+        payload = json.dumps(event, default=str).encode()
         await ctx.room.local_participant.publish_data(
             payload,
             reliable=True,
-            topic="tool_event",
+            topic=event.get("type", "event"),
         )
     except Exception as e:
-        logger.warning(f"Failed to emit tool event: {e}")
+        logger.warning(f"emit_event failed: {e}")
 
 
 # ─── Gemini LLM Wrapper ────────────────────────────────────────────────────
 
 class GeminiLLM(llm.LLM):
-    """
-    Wraps Google Gemini with function calling support.
-    Maintains multi-turn conversation history within a session.
-    """
-
     def __init__(self, ctx: JobContext, session_id: str):
         super().__init__()
         self._ctx = ctx
         self._session_id = session_id
-        self._chat = client.chats.create(
+        self._client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        # FIX 2: trailing comma after create(...) was making _chat a tuple, not a chat object
+        # Before: self._chat = self._client.aio.chats.create(...),   ← tuple!
+        # After:  self._chat = self._client.aio.chats.create(...)    ← chat object
+        self._chat = self._client.aio.chats.create(
             model=settings.GEMINI_MODEL,
-            config={
-                "tools": [{"function_declarations": TOOL_DECLARATIONS}],
-                "system_instruction": SYSTEM_PROMPT,
-            }
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)],
+                system_instruction=SYSTEM_PROMPT,
+            ),
         )
-        self._transcript: list[dict] = []
 
-    @property
-    def transcript(self) -> list[dict]:
-        return self._transcript
-
-    async def chat(
+    def chat(
         self,
+        *,
         chat_ctx: llm.ChatContext,
-        fnc_ctx: Optional[llm.ToolContext] = None,
+        tools=None,
+        conn_options=DEFAULT_API_CONNECT_OPTIONS,
+        parallel_tool_calls=NOT_GIVEN,
+        tool_choice=NOT_GIVEN,
+        extra_kwargs=NOT_GIVEN,
     ) -> "GeminiStream":
-        # Extract the latest user message
         last_user_msg = ""
-        for msg in reversed(chat_ctx.messages):
-            if msg.role == llm.ChatRole.USER:
-                last_user_msg = msg.content if isinstance(msg.content, str) else ""
+        for msg in reversed(chat_ctx.messages()):
+            if msg.role == "user":
+                last_user_msg = msg.text_content or ""
                 break
-
         return GeminiStream(
             gemini_llm=self,
             user_message=last_user_msg,
+            chat_ctx=chat_ctx,
+            tools=tools or [],
+            conn_options=conn_options,
         )
 
     async def _process_message(self, user_message: str) -> str:
-        """Send message to Gemini, handle tool calls, return final text response."""
-        import time
+        """Agentic loop: call Gemini, handle tool calls, return final text."""
+        response = await self._chat.send_message(message=user_message)
 
-        self._transcript.append({
-            "role": "user",
-            "content": user_message,
-            "timestamp": time.time(),
-        })
-
-        # google-genai handles the conversation state in the chat object
-        response = client.chats.send(message=user_message)
-
-        # Agentic loop: keep processing until no more function calls
         while True:
             text_parts = []
-            tool_calls = []
+            function_calls = []
 
-            if response.candidates:
+            if response.candidates and response.candidates[0].content.parts:
                 for part in response.candidates[0].content.parts:
-                    if part.call:
-                        tool_calls.append(part.call)
+                    if part.function_call:
+                        function_calls.append(part.function_call)
                     elif part.text:
                         text_parts.append(part.text)
 
-            if not tool_calls:
-                # Final text response
-                final_text = "".join(text_parts)
-                self._transcript.append({
-                    "role": "assistant",
-                    "content": final_text,
-                    "timestamp": time.time(),
-                })
-                return final_text
+            if not function_calls:
+                return " ".join(text_parts)
 
-            # Execute all tool calls
-            tool_responses = []
-            for tc in tool_calls:
-                tool_name = tc.name
-                tool_args = tc.args
-
+            function_responses = []
+            for fc in function_calls:
+                tool_name = fc.name
+                tool_args = dict(fc.args)
                 logger.info(f"Tool call: {tool_name}({tool_args})")
 
-                # Notify frontend
-                await emit_tool_event(self._ctx, {
-                    "type": "tool_start",
+                await emit_event(self._ctx, {
+                    "type": "tool_event",
+                    "event": "tool_start",
                     "tool": tool_name,
                     "args": tool_args,
                     "session_id": self._session_id,
                 })
 
-                # Execute tool
                 result = await _execute_tool(tool_name, tool_args)
-
                 logger.info(f"Tool result: {tool_name} → {result}")
 
-                # Notify frontend with result
-                await emit_tool_event(self._ctx, {
-                    "type": "tool_done",
+                await emit_event(self._ctx, {
+                    "type": "tool_event",
+                    "event": "tool_done",
                     "tool": tool_name,
                     "result": result,
                     "session_id": self._session_id,
                 })
 
-                tool_responses.append(
-                    {
-                        "function_response": {
-                            "name": tool_name,
-                            "response": {"result": json.dumps(result, default=str)},
-                        }
-                    }
+                function_responses.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name=tool_name,
+                            response={"result": json.dumps(result, default=str)},
+                        )
+                    )
                 )
 
-            # Send all tool results back to Gemini
-            response = client.chats.send(message=tool_responses)
+            response = await self._chat.send_message(message=function_responses)
 
 
 class GeminiStream(llm.LLMStream):
-    """Wraps GeminiLLM._process_message as an LLMStream."""
-
-    def __init__(self, gemini_llm: GeminiLLM, user_message: str):
-        super().__init__(
-            gemini_llm,
-            chat_ctx=llm.ChatContext(),
-            tools=[],
-            conn_options=llm.DEFAULT_API_CONNECT_OPTIONS,
-        )
+    def __init__(self, gemini_llm: GeminiLLM, user_message: str, chat_ctx, tools, conn_options):
+        super().__init__(gemini_llm, chat_ctx=chat_ctx, tools=tools, conn_options=conn_options)
         self._gemini_llm = gemini_llm
         self._user_message = user_message
 
     async def _run(self):
         text = await self._gemini_llm._process_message(self._user_message)
-        # Emit final text as a chat chunk
         self._event_ch.send_nowait(
             llm.ChatChunk(
                 id=str(uuid.uuid4()),
@@ -205,19 +172,18 @@ class GeminiStream(llm.LLMStream):
 # ─── Tool Dispatcher ───────────────────────────────────────────────────────
 
 async def _execute_tool(name: str, args: dict) -> dict:
-    """Route tool calls to their implementations."""
     dispatch = {
-        "identify_user": lambda: identify_user(**args),
-        "fetch_slots": lambda: fetch_slots(
+        "identify_user":         lambda: identify_user(**args),
+        "fetch_slots":           lambda: fetch_slots(
             specialty=args.get("specialty"),
             doctor_name=args.get("doctor_name"),
             date_str=args.get("date"),
         ),
-        "book_appointment": lambda: book_appointment(**args),
+        "book_appointment":      lambda: book_appointment(**args),
         "retrieve_appointments": lambda: retrieve_appointments(**args),
-        "cancel_appointment": lambda: cancel_appointment(**args),
-        "modify_appointment": lambda: modify_appointment(**args),
-        "end_conversation": lambda: end_conversation(**args),
+        "cancel_appointment":    lambda: cancel_appointment(**args),
+        "modify_appointment":    lambda: modify_appointment(**args),
+        "end_conversation":      lambda: end_conversation(**args),
     }
     handler = dispatch.get(name)
     if not handler:
@@ -225,23 +191,21 @@ async def _execute_tool(name: str, args: dict) -> dict:
     try:
         return await handler()
     except Exception as e:
-        logger.error(f"Tool {name} failed: {e}")
+        logger.error(f"Tool {name} raised: {e}")
         return {"error": str(e)}
 
 
-# ─── Agent Entry Point ─────────────────────────────────────────────────────
+# ─── Entry Point ───────────────────────────────────────────────────────────
 
 async def entrypoint(ctx: JobContext):
-    """Called by LiveKit Workers when a new room job is dispatched."""
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
     session_id = str(uuid.uuid4())
-    logger.info(f"Agent starting in room {ctx.room.name}, session={session_id}")
+    logger.info(f"Agent joined room={ctx.room.name} session={session_id}")
 
     gemini_llm = GeminiLLM(ctx=ctx, session_id=session_id)
 
-    assistant = VoiceAssistant(
-        instructions=SYSTEM_PROMPT,
+    session = AgentSession(
         vad=silero.VAD.load(),
         stt=deepgram.STT(api_key=settings.DEEPGRAM_API_KEY),
         llm=gemini_llm,
@@ -249,13 +213,58 @@ async def entrypoint(ctx: JobContext):
             api_key=settings.CARTESIA_API_KEY,
             voice=settings.CARTESIA_VOICE_ID,
         ),
+        turn_handling={
+            "interruption": {"mode": "vad"}
+        }
     )
+    agent = Agent(instructions=SYSTEM_PROMPT)
 
-    assistant.start(ctx.room)
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(ev):
+        if not ev.is_final:
+            return
+        asyncio.ensure_future(emit_event(ctx, {
+            "type": "transcript",
+            "role": "user",
+            "content": ev.transcript,
+            "timestamp": time.time(),
+            "session_id": session_id,
+        }))
 
-    # Greet the patient on connect
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(ev):
+        item = ev.item
+        if getattr(item, "type", None) != "message" or getattr(item, "role", None) != "assistant":
+            return
+        content = item.text_content or ""
+        if not content:
+            return
+        asyncio.ensure_future(emit_event(ctx, {
+            "type": "transcript",
+            "role": "agent",
+            "content": content,
+            "timestamp": time.time(),
+            "session_id": session_id,
+        }))
+
+    @session.on("agent_state_changed")
+    def on_agent_state_changed(ev):
+        if ev.new_state == "speaking":
+            speaking = True
+        elif ev.old_state == "speaking":
+            speaking = False
+        else:
+            return
+        asyncio.ensure_future(emit_event(ctx, {
+            "type": "speaking_state",
+            "speaking": speaking,
+            "session_id": session_id,
+        }))
+
+    await session.start(agent, room=ctx.room)
+
     await asyncio.sleep(1)
-    await assistant.say(
+    session.say(
         "Hello! I'm Mia from Mykare Health. How can I help you today?",
         allow_interruptions=True,
     )

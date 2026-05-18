@@ -1,6 +1,9 @@
 /**
  * App.jsx — Root component
- * Owns all shared state: session, tool events, transcript, appointments, summary.
+ *
+ * IMPORTANT: Do NOT import anything from @livekit/components-react here.
+ * We use the raw livekit-client Room via useVoiceSession only.
+ * LiveKit's prebuilt React UI will override our custom layout if imported.
  */
 import { useState, useCallback, useRef } from 'react'
 import { useVoiceSession } from './hooks/useVoiceSession'
@@ -12,62 +15,77 @@ import AppointmentPanel from './components/AppointmentPanel'
 import SummaryModal from './components/SummaryModal'
 
 export default function App() {
-  const [transcript, setTranscript]     = useState([])
-  const [toolEvents, setToolEvents]     = useState([])
-  const [appointments, setAppointments] = useState([])
+  const [transcript, setTranscript]       = useState([])
+  const [toolEvents, setToolEvents]       = useState([])
+  const [appointments, setAppointments]   = useState([])
   const [agentSpeaking, setAgentSpeaking] = useState(false)
-  const [showSummary, setShowSummary]   = useState(false)
-  const [userPhone, setUserPhone]       = useState(null)
+  const [showSummary, setShowSummary]     = useState(false)
+  const [userPhone, setUserPhone]         = useState(null)
 
   const transcriptRef = useRef(transcript)
   transcriptRef.current = transcript
 
-  // ── Tool event handler ───────────────────────────────────
+  // ── Tool event handler ─────────────────────────────────────────────────
   const handleToolEvent = useCallback((event) => {
-    setToolEvents(prev => [...prev, event])
+    // Normalise: agent can emit {type, event, tool} or {type, tool, event}
+    const toolName  = event.tool
+    const eventKind = event.event   // "tool_start" | "tool_done"
 
-    // Extract user phone from identify_user result
-    if (event.type === 'tool_done' && event.tool === 'identify_user') {
-      const phone = event.result?.user?.phone
-      if (phone) setUserPhone(phone)
-    }
+    setToolEvents(prev => [...prev, { ...event, type: eventKind }])
 
-    // Update appointments from booking / retrieval results
-    if (event.type === 'tool_done') {
-      if (event.tool === 'book_appointment' && event.result?.appointment) {
-        const a = event.result.appointment
-        setAppointments(prev => [...prev, { ...a, status: 'booked' }])
+    if (eventKind === 'tool_done') {
+      const result = event.result || {}
+
+      // Extract user phone from identify_user
+      if (toolName === 'identify_user' && result.user?.phone) {
+        setUserPhone(result.user.phone)
       }
-      if (event.tool === 'retrieve_appointments' && event.result?.appointments) {
-        setAppointments(event.result.appointments)
+
+      // Update appointment list live
+      if (toolName === 'book_appointment' && result.status === 'booked' && result.appointment) {
+        setAppointments(prev => [...prev, { ...result.appointment, status: 'booked' }])
       }
-      if (event.tool === 'cancel_appointment' && event.result?.status === 'cancelled') {
+      if (toolName === 'retrieve_appointments' && result.appointments) {
+        setAppointments(result.appointments)
+      }
+      if (toolName === 'cancel_appointment' && result.status === 'cancelled') {
         setAppointments(prev =>
-          prev.map(a => a.id === event.result.appointment_id ? { ...a, status: 'cancelled' } : a)
+          prev.map(a =>
+            a.doctor === event.args?.doctor || a.id === event.args?.appointment_id
+              ? { ...a, status: 'cancelled' }
+              : a
+          )
         )
       }
-      if (event.tool === 'end_conversation') {
+      if (toolName === 'end_conversation') {
         setShowSummary(true)
       }
     }
   }, [])
 
-  // ── Transcript / speaking handler ────────────────────────
+  // ── Transcript handler ─────────────────────────────────────────────────
   const handleTranscript = useCallback((data) => {
-    if (typeof data.speaking === 'boolean') {
-      setAgentSpeaking(data.speaking)
-      return
-    }
-    if (data.content) {
-      setTranscript(prev => [...prev, { ...data, timestamp: Date.now() / 1000 }])
+    if (data.type === 'message' && data.content) {
+      setTranscript(prev => [...prev, {
+        role:      data.role,
+        content:   data.content,
+        timestamp: data.timestamp || Date.now() / 1000,
+      }])
     }
   }, [])
 
-  // ── Voice session ────────────────────────────────────────
-  const { status, isMuted, sessionId, connect, disconnect, toggleMute } = useVoiceSession({
-    onToolEvent: handleToolEvent,
-    onTranscript: handleTranscript,
-  })
+  // ── Speaking state handler ─────────────────────────────────────────────
+  const handleSpeakingState = useCallback((speaking) => {
+    setAgentSpeaking(speaking)
+  }, [])
+
+  // ── Voice session ──────────────────────────────────────────────────────
+  const { status, isMuted, sessionId, localVideoTrack, connect, disconnect, toggleMute } =
+    useVoiceSession({
+      onToolEvent:     handleToolEvent,
+      onTranscript:    handleTranscript,
+      onSpeakingState: handleSpeakingState,
+    })
 
   const handleDisconnect = useCallback(async () => {
     await disconnect()
@@ -78,20 +96,21 @@ export default function App() {
     <div className="app-layout">
       <Header status={status} sessionId={sessionId} />
 
-      {/* Left: Transcript */}
+      {/* Left — Transcript */}
       <Transcript messages={transcript} />
 
-      {/* Center: Call interface */}
+      {/* Center — Main Interface */}
       <CallInterface
         status={status}
         isMuted={isMuted}
         agentSpeaking={agentSpeaking}
+        localVideoTrack={localVideoTrack}
         onConnect={connect}
         onDisconnect={handleDisconnect}
         onToggleMute={toggleMute}
       />
 
-      {/* Right: Tool status + Appointments */}
+      {/* Right — Tool events + Appointments */}
       <div className="panel" style={{ overflow: 'hidden' }}>
         <div style={{ flex: '0 0 auto' }}>
           <ToolStatus events={toolEvents} />
@@ -101,7 +120,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* Summary modal */}
+      {/* Summary modal — slides up on call end */}
       {showSummary && (
         <SummaryModal
           sessionId={sessionId}

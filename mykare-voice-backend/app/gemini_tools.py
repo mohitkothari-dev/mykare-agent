@@ -1,6 +1,7 @@
 """
-Gemini function declarations + system prompt for the Mykare voice agent.
-These are passed directly to google.genai as tool definitions.
+Gemini function declarations + system prompt — new google.genai SDK style.
+TOOL_DECLARATIONS is a plain list of dicts, which types.Tool(function_declarations=...)
+accepts directly.
 """
 
 SYSTEM_PROMPT = """
@@ -23,9 +24,9 @@ WORKFLOW (strictly follow this order)
 7. Call cancel_appointment or modify_appointment as needed
 8. Call end_conversation when the patient is done — always before saying goodbye
 
-ERROR HANDLING (agentic behavior)
+ERROR HANDLING
 - If a slot is unavailable, autonomously call fetch_slots again and suggest alternatives
-- If you're missing a required piece of info, ask for just that one thing
+- If you are missing a required piece of info, ask for just that one thing
 - If the patient is confused, gently guide them back
 
 WHAT TO EXTRACT
@@ -33,7 +34,7 @@ WHAT TO EXTRACT
 - Phone number (10-digit, used as unique ID)
 - Specialty or doctor name
 - Preferred date and time
-- Reason/notes (optional)
+- Reason or notes (optional)
 
 NEVER
 - Make up slot availability — always call fetch_slots
@@ -43,21 +44,23 @@ NEVER
 
 
 # ─── Function Declarations ─────────────────────────────────────────────────
+# Plain dicts — compatible with types.Tool(function_declarations=TOOL_DECLARATIONS)
+# in the new google.genai SDK.
 
 TOOL_DECLARATIONS = [
     {
         "name": "identify_user",
         "description": "Identify or register a patient by their phone number. Call this before any appointment action.",
         "parameters": {
-            "type": "OBJECT",
+            "type": "object",
             "properties": {
                 "phone": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "Patient's 10-digit phone number",
                 },
                 "name": {
-                    "type": "STRING",
-                    "description": "Patient's full name (if provided)",
+                    "type": "string",
+                    "description": "Patient's full name if provided",
                 },
             },
             "required": ["phone"],
@@ -67,18 +70,18 @@ TOOL_DECLARATIONS = [
         "name": "fetch_slots",
         "description": "Fetch available appointment slots. Filter by specialty, doctor name, and/or date.",
         "parameters": {
-            "type": "OBJECT",
+            "type": "object",
             "properties": {
                 "specialty": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "Medical specialty e.g. Cardiology, Dermatology, General Physician",
                 },
                 "doctor_name": {
-                    "type": "STRING",
-                    "description": "Specific doctor's name if patient has a preference",
+                    "type": "string",
+                    "description": "Specific doctor name if patient has a preference",
                 },
                 "date": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "Requested date in YYYY-MM-DD format",
                 },
             },
@@ -88,18 +91,18 @@ TOOL_DECLARATIONS = [
         "name": "book_appointment",
         "description": "Book a specific slot for a patient. Prevents double booking.",
         "parameters": {
-            "type": "OBJECT",
+            "type": "object",
             "properties": {
                 "user_phone": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "Patient's phone number",
                 },
                 "slot_id": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "The slot ID from fetch_slots result",
                 },
                 "notes": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "Optional notes or reason for visit",
                 },
             },
@@ -110,10 +113,10 @@ TOOL_DECLARATIONS = [
         "name": "retrieve_appointments",
         "description": "Retrieve all active appointments for a patient.",
         "parameters": {
-            "type": "OBJECT",
+            "type": "object",
             "properties": {
                 "user_phone": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "Patient's phone number",
                 },
             },
@@ -124,14 +127,14 @@ TOOL_DECLARATIONS = [
         "name": "cancel_appointment",
         "description": "Cancel a booked appointment and free the slot.",
         "parameters": {
-            "type": "OBJECT",
+            "type": "object",
             "properties": {
                 "appointment_id": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "The appointment ID to cancel",
                 },
                 "user_phone": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "Patient's phone number for verification",
                 },
             },
@@ -142,18 +145,18 @@ TOOL_DECLARATIONS = [
         "name": "modify_appointment",
         "description": "Reschedule an existing appointment to a new slot.",
         "parameters": {
-            "type": "OBJECT",
+            "type": "object",
             "properties": {
                 "appointment_id": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "Current appointment ID",
                 },
                 "user_phone": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "Patient's phone number",
                 },
                 "new_slot_id": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "New slot ID from fetch_slots",
                 },
             },
@@ -164,14 +167,14 @@ TOOL_DECLARATIONS = [
         "name": "end_conversation",
         "description": "End the call gracefully. Always call this before saying goodbye.",
         "parameters": {
-            "type": "OBJECT",
+            "type": "object",
             "properties": {
                 "session_id": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "Current session ID",
                 },
                 "user_phone": {
-                    "type": "STRING",
+                    "type": "string",
                     "description": "Patient's phone number if identified",
                 },
             },
